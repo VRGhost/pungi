@@ -13,17 +13,24 @@
 # Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 
 import hashlib
+import logging
 import os
 import select
 import shutil
 import subprocess
 import sys
+import tempfile
 
-def _doRunCommand(command, logger, rundir='/tmp', output=None, env=None):
+def _doRunCommand(command, logger, rundir=None, output=None, env=None):
     """Run a command and log the output.  Error out if we get something on stderr"""
 
+    logger.info("doRunCommand: Running %s" % subprocess.list2cmdline(command))
 
-    logger.info("Running %s" % subprocess.list2cmdline(command))
+    if not rundir:
+        rundir = tempfile.gettempdir()
+
+    if not os.path.isdir(rundir):
+        raise OSError("No %r directory" % rundir)
 
     proc = subprocess.Popen(
         command, cwd=rundir,
@@ -44,7 +51,6 @@ def _doRunCommand(command, logger, rundir='/tmp', output=None, env=None):
         proc.stdout.fileno(): stdout_dict,
         proc.stderr.fileno(): stderr_dict,
     }
-    joint_output = ""
 
     poll = select.poll()
     activeStreams = 0
@@ -59,22 +65,23 @@ def _doRunCommand(command, logger, rundir='/tmp', output=None, env=None):
             if event & select.POLLIN:
                 line = data["fobj"].readline()
                 data["data"] += line
-                joint_output += line
+                logger.info("doRunCommand: " + line.rstrip())
 
             if event & select.POLLHUP:
                 poll.unregister(fd)
                 activeStreams -= 1
-
-    if joint_output:
-        logger.debug(joint_output)
+    proc.wait()
 
     if output:
         output.write(stdout_dict["data"])
 
-    if p1.returncode != 0:
-        logger.error("Got an error from %s" % command[0])
-        logger.error(err)
-        raise OSError, "Got an error from %s: %s" % (command[0], err)
+    if proc.returncode != 0:
+        logger.error("doRunCommand: Got an error from %s" % command[0])
+        raise OSError("Got an error (%r) from %s: %s" % (
+            proc.returncode, command[0], stderr_dict["data"]
+        ))
+    else:
+        logger.debug("doRunCommand: Execution of %r comleted successfully." % command[0])
 
 def _link(local, target, logger, force=False):
     """Simple function to link or copy a package, removing target optionally."""
