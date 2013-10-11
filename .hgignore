@@ -1,0 +1,11 @@
+syntax: glob
+*.pyc
+*~
+pungi.pidaproject
+.project
+.pydevproject
+.settings/org.eclipse.mylyn.tasks.ui.prefs
+MANIFEST
+build/*
+dist/*
+noarch/*
