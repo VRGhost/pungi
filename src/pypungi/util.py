@@ -12,23 +12,64 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 
-import subprocess
-import os
-import shutil
-import sys
 import hashlib
+import os
+import select
+import shutil
+import subprocess
+import sys
 
-def _doRunCommand(command, logger, rundir='/tmp', output=subprocess.PIPE, error=subprocess.PIPE, env=None):
+def _doRunCommand(command, logger, rundir='/tmp', output=None, env=None):
     """Run a command and log the output.  Error out if we get something on stderr"""
 
 
     logger.info("Running %s" % subprocess.list2cmdline(command))
 
-    p1 = subprocess.Popen(command, cwd=rundir, stdout=output, stderr=error, universal_newlines=True, env=env)
-    (out, err) = p1.communicate()
+    proc = subprocess.Popen(
+        command, cwd=rundir,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        universal_newlines=True, env=env
+    )
 
-    if out:
-        logger.debug(out)
+    stdout_dict = {
+        "fobj": proc.stdout,
+        "data": "",
+    }
+    stderr_dict = {
+        "fobj": proc.stderr,
+        "data": "",
+    }
+
+    streams = {
+        proc.stdout.fileno(): stdout_dict,
+        proc.stderr.fileno(): stderr_dict,
+    }
+    joint_output = ""
+
+    poll = select.poll()
+    activeStreams = 0
+    for data in streams.values():
+        poll.register(data["fobj"], select.POLLIN | select.POLLHUP)
+        activeStreams += 1
+
+    while activeStreams > 0:
+        for (fd, event) in poll.poll():
+            data = streams[fd]
+
+            if event & select.POLLIN:
+                line = data["fobj"].readline()
+                data["data"] += line
+                joint_output += line
+
+            if event & select.POLLHUP:
+                poll.unregister(fd)
+                activeStreams -= 1
+
+    if joint_output:
+        logger.debug(joint_output)
+
+    if output:
+        output.write(stdout_dict["data"])
 
     if p1.returncode != 0:
         logger.error("Got an error from %s" % command[0])

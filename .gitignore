@@ -1,0 +1,9 @@
+*.swp
+*~
+.*
+*.sublime-workspace
+*.py?
+*.tar.gz
+/build/
+/dist/
+/MANIFEST

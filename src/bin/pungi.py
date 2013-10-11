@@ -30,11 +30,11 @@ def main():
     if os.geteuid () != 0 and (opts.do_all or opts.do_buildinstall):
         print >> sys.stderr, "You must run pungi as root"
         return 1
-    
+
     if opts.do_all or opts.do_buildinstall:
         try:
-            selinux = subprocess.Popen('/usr/sbin/getenforce', 
-                                       stdout=subprocess.PIPE, 
+            selinux = subprocess.Popen('/usr/sbin/getenforce',
+                                       stdout=subprocess.PIPE,
                                        stderr=open('/dev/null', 'w')).communicate()[0].strip('\n')
             if selinux == 'Enforcing':
                 print >> sys.stdout, "WARNING: SELinux is enforcing.  This may lead to a compose with selinux disabled."
@@ -52,7 +52,7 @@ def main():
     for part in ksparser.handler.partition.partitions:
         if part.mountpoint == 'iso':
             config.set('pungi', 'cdsize', str(part.size))
-            
+
     config.set('pungi', 'force', str(opts.force))
 
     # Set up our directories
@@ -200,11 +200,11 @@ if __name__ == '__main__':
 
 
         (opts, args) = parser.parse_args()
-        
+
         if not opts.config:
             parser.print_help()
             sys.exit(0)
-            
+
         if not config.get('pungi', 'flavor').isalnum() and not config.get('pungi', 'flavor') == '':
             print >> sys.stderr, "Flavor must be alphanumeric."
             sys.exit(1)
