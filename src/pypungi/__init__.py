@@ -12,19 +12,22 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 
-import yum
+import ConfigParser
+import createrepo
+import gzip
+import logging
 import os
+import pypungi.splittree
+import pypungi.util
 import re
 import shutil
-import sys
-import gzip
-import pypungi.util
-import logging
-import urlgrabber.progress
 import subprocess
-import createrepo
-import ConfigParser
-import pypungi.splittree
+import sys
+import urlgrabber.progress
+import yum
+
+from . import exceptions
+from .__version__ import version as __version__
 
 class MyConfigParser(ConfigParser.ConfigParser):
     """A subclass of ConfigParser which does not lowercase options"""
@@ -80,6 +83,7 @@ class PungiYum(yum.YumBase):
     def __init__(self, config):
         self.pungiconfig = config
         yum.YumBase.__init__(self)
+        self.conf = config
 
     def doLoggingSetup(self, debuglevel, errorlevel, syslog_ident=None, syslog_facility=None):
         """Setup the logging facility."""
@@ -104,7 +108,7 @@ class PungiYum(yum.YumBase):
 class Pungi(pypungi.PungiBase):
     def __init__(self, config, ksparser):
         pypungi.PungiBase.__init__(self, config)
- 
+
         # Set our own logging name space
         self.logger = logging.getLogger('Pungi')
 
@@ -216,7 +220,7 @@ class Pungi(pypungi.PungiBase):
 
         self.ayum.repos.setProgressBar(CallBack())
         self.ayum.repos.callback = CallBack()
-        
+
         # Set the metadata and mirror list to be expired so we always get new ones.
         for repo in self.ayum.repos.listEnabled():
             repo.metadata_expire = 0
@@ -226,6 +230,9 @@ class Pungi(pypungi.PungiBase):
 
         self.logger.info('Getting sacks for arches %s' % arches)
         self.ayum._getSacks(archlist=arches)
+
+        self.logger.info("Merging aym config...")
+        self.ayum.conf.exclude.extend(self.ksparser.handler.packages.excludedList)
 
     def _filtersrcdebug(self, po):
         """Filter out package objects that are of 'src' arch."""
@@ -371,12 +378,11 @@ class Pungi(pypungi.PungiBase):
            Returns a list of package objects"""
 
         final_pkgobjs = {} # The final list of package objects
-        searchlist = [] # The list of package names/globs to search for
         matchdict = {} # A dict of objects to names
 
         # First remove the excludes
         self.ayum.excludePackages()
-        
+
         # Always add the core group
         self.ksparser.handler.packages.add(['@core'])
 
@@ -389,36 +395,45 @@ class Pungi(pypungi.PungiBase):
         if self.ksparser.handler.packages.addBase:
             self.ksparser.handler.packages.add(['@base'])
 
+        searchlist = {} # The dict of package names/globs <-> requirement source to search for
         # Get a list of packages from groups
         for group in self.ksparser.handler.packages.groupList:
-            searchlist.extend(self.getPackagesFromGroup(group))
+            for pkg in self.getPackagesFromGroup(group):
+                searchlist[pkg] = group
 
         # Add the adds
-        searchlist.extend(self.ksparser.handler.packages.packageList)
+        for pkg in self.ksparser.handler.packages.packageList:
+            searchlist[pkg] = "kickstart_file"
 
         # Make the search list unique
-        searchlist = yum.misc.unique(searchlist)
+        searchlistUnique = yum.misc.unique(searchlist.keys())
+
+        allPackages = self.ayum.pkgSack.returnPackages()
 
         # Search repos for things in our searchlist, supports globs
-        (exactmatched, matched, unmatched) = yum.packages.parsePackages(self.ayum.pkgSack.returnPackages(), searchlist, casematch=1)
+        (exactmatched, matched, unmatched) = yum.packages.parsePackages(allPackages, searchlistUnique, casematch=1)
         matches = filter(self._filtersrcdebug, exactmatched + matched)
 
         # Populate a dict of package objects to their names
         for match in matches:
             matchdict[match.name] = match
-            
+
         # Get the newest results from the search
         mysack = yum.packageSack.ListPackageSack(matches)
         for match in mysack.returnNewestByNameArch():
             self.ayum.tsInfo.addInstall(match)
             self.logger.debug('Found %s.%s' % (match.name, match.arch))
 
+        # raise an exception if there is an unmatched non-ignored package
         for pkg in unmatched:
-            if not pkg in matchdict.keys():
-                self.logger.warn('Could not find a match for %s in any configured repo' % pkg)
+            if (pkg not in matchdict.keys()) and (pkg not in self.ksparser.handler.packages.excludedList):
+                raise exceptions.MissingPackageError('Could not find a match for %r in any configured repo (source requirement: %s)' % (
+                    pkg, searchlist.get(pkg),
+                ))
+
 
         if len(self.ayum.tsInfo) == 0:
-            raise yum.Errors.MiscError, 'No packages found to download.'
+            raise exceptions.MissingPackageError('No packages found to download.')
 
         # Deselect things we don't want from the ks
         map(self._deselectPackage, self.ksparser.handler.packages.excludedList)
@@ -672,11 +687,11 @@ class Pungi(pypungi.PungiBase):
         basedir = os.path.join(self.destdir, self.config.get('pungi', 'version'))
         if subfile.startswith(basedir):
             return subfile.replace(basedir + os.path.sep, '')
-        
+
     def _makeMetadata(self, path, cachedir, comps=False, repoview=False, repoviewtitle=False,
                       baseurl=False, output=False, basedir=False, split=False, update=True):
         """Create repodata and repoview."""
-        
+
         conf = createrepo.MetaDataConfig()
         conf.cachedir = os.path.join(cachedir, 'createrepocache')
         conf.update = update
@@ -703,24 +718,24 @@ class Pungi(pypungi.PungiBase):
         repomatic.doPkgMetadata()
         repomatic.doRepoMetadata()
         repomatic.doFinalMove()
-        
+
         if repoview:
             # setup the repoview call
             repoview = ['/usr/bin/repoview']
             repoview.append('--quiet')
-            
+
             repoview.append('--state-dir')
             repoview.append(os.path.join(cachedir, 'repoviewcache'))
-            
+
             if repoviewtitle:
                 repoview.append('--title')
                 repoview.append(repoviewtitle)
-    
+
             repoview.append(path)
-    
+
             # run the command
             pypungi.util._doRunCommand(repoview, self.logger)
-        
+
     def doCreaterepo(self, comps=True):
         """Run createrepo to generate repodata in the tree."""
 
@@ -728,15 +743,15 @@ class Pungi(pypungi.PungiBase):
         compsfile = None
         if comps:
             compsfile = os.path.join(self.workdir, '%s-%s-comps.xml' % (self.config.get('pungi', 'name'), self.config.get('pungi', 'version')))
-        
+
         # setup the cache dirs
         for target in ['createrepocache', 'repoviewcache']:
             pypungi.util._ensuredir(os.path.join(self.config.get('pungi', 'cachedir'),
-                                            target), 
-                               self.logger, 
+                                            target),
+                               self.logger,
                                force=True)
-            
-        repoviewtitle = '%s %s - %s' % (self.config.get('pungi', 'name'), 
+
+        repoviewtitle = '%s %s - %s' % (self.config.get('pungi', 'name'),
                                         self.config.get('pungi', 'version'),
                                         self.config.get('pungi', 'arch'))
 
@@ -830,7 +845,7 @@ class Pungi(pypungi.PungiBase):
 
         # Walk the os/images path to get sums of all the files
         os.path.walk(os.path.join(self.topdir, 'images'), getsum, self.topdir + '/')
-        
+
         # Capture PPC images
         if self.config.get('pungi', 'arch') == 'ppc':
             os.path.walk(os.path.join(self.topdir, 'ppc'), getsum, self.topdir + '/')
@@ -900,7 +915,7 @@ class Pungi(pypungi.PungiBase):
                     extraargs = [os.path.join(self.topdir, self.config.get('pungi', 'product_path'), pkg)]
                     try:
                         p1 = subprocess.Popen(rpm2cpio + extraargs, cwd=docsdir, stdout=subprocess.PIPE)
-                        (out, err) = subprocess.Popen(cpio, cwd=docsdir, stdin=p1.stdout, stdout=subprocess.PIPE, 
+                        (out, err) = subprocess.Popen(cpio, cwd=docsdir, stdin=p1.stdout, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, universal_newlines=True).communicate()
                     except:
                         self.logger.error("Got an error from rpm2cpio")
@@ -926,7 +941,7 @@ class Pungi(pypungi.PungiBase):
                     if regex.match(directory) and not os.path.exists(os.path.join(self.topdir, directory)):
                         self.logger.info("Copying release note dir %s" % directory)
                         shutil.copytree(os.path.join(dirpath, directory), os.path.join(self.topdir, directory))
-        
+
     def doSplittree(self):
         """Use anaconda-runtime's splittree to split the tree into appropriate
            sized chunks."""
@@ -943,7 +958,7 @@ class Pungi(pypungi.PungiBase):
         timber.product_path = self.config.get('pungi', 'product_path')
         timber.common_files = self.common_files
         timber.comps_size = 0
-        #timber.reserve_size =  
+        #timber.reserve_size =
 
         self.logger.info("Running splittree.")
 
@@ -972,7 +987,7 @@ class Pungi(pypungi.PungiBase):
                                       self.config.get('pungi', 'flavor'),
                                       'source', 'SRPMS')
         #timber.product_path = self.config.get('pungi', 'product_path')
-        #timber.reserve_size =  
+        #timber.reserve_size =
 
         self.logger.info("Splitting SRPMs")
         timber.splitSRPMS()
@@ -988,7 +1003,7 @@ class Pungi(pypungi.PungiBase):
         compsfile = os.path.join(self.workdir, '%s-%s-comps.xml' % (self.config.get('pungi', 'name'), self.config.get('pungi', 'version')))
 
         if not split:
-            pypungi.util._ensuredir('%s-disc1' % self.topdir, self.logger, 
+            pypungi.util._ensuredir('%s-disc1' % self.topdir, self.logger,
                                clean=True) # rename this for single disc
             path = self.topdir
             basedir=None
@@ -998,11 +1013,11 @@ class Pungi(pypungi.PungiBase):
             split=[]
             for disc in range(1, self.config.getint('pungi', 'discs') + 1):
                 split.append('%s-disc%s' % (self.topdir, disc))
-            
+
         # set up the process
-        self._makeMetadata(path, self.config.get('pungi', 'cachedir'), compsfile, repoview=False, 
-                                                 baseurl='media://%s' % mediaid, 
-                                                 output='%s-disc1' % self.topdir, 
+        self._makeMetadata(path, self.config.get('pungi', 'cachedir'), compsfile, repoview=False,
+                                                 baseurl='media://%s' % mediaid,
+                                                 output='%s-disc1' % self.topdir,
                                                  basedir=basedir, split=split, update=False)
 
         # Write out a repo file for the disc to be used on the installed system
@@ -1052,7 +1067,7 @@ cost=500
         mkisofs = ['/usr/bin/mkisofs']
         mkisofs.extend(['-v', '-U', '-J', '-R', '-T', '-m', 'repoview', '-m', 'boot.iso']) # common mkisofs flags
 
-        x86bootargs = ['-b', 'isolinux/isolinux.bin', '-c', 'isolinux/boot.cat', 
+        x86bootargs = ['-b', 'isolinux/isolinux.bin', '-c', 'isolinux/boot.cat',
             '-no-emul-boot', '-boot-load-size', '4', '-boot-info-table']
 
         ia64bootargs = ['-b', 'images/boot.img', '-no-emul-boot']
@@ -1074,7 +1089,7 @@ cost=500
         if not self.config.get('pungi', 'arch') == 'source':
             treesize = int(subprocess.Popen(mkisofs + ['-print-size', '-quiet', self.topdir], stdout=subprocess.PIPE).communicate()[0])
         else:
-            srcdir = os.path.join(self.config.get('pungi', 'destdir'), self.config.get('pungi', 'version'), 
+            srcdir = os.path.join(self.config.get('pungi', 'destdir'), self.config.get('pungi', 'version'),
                                   self.config.get('pungi', 'flavor'), 'source', 'SRPMS')
 
             treesize = int(subprocess.Popen(mkisofs + ['-print-size', '-quiet', srcdir], stdout=subprocess.PIPE).communicate()[0])
@@ -1085,22 +1100,22 @@ cost=500
             self.doCreateMediarepo(split=False)
 
         if treesize > 700: # we're larger than a 700meg CD
-            isoname = '%s-%s-%s-DVD.iso' % (self.config.get('pungi', 'iso_basename'), self.config.get('pungi', 'version'), 
+            isoname = '%s-%s-%s-DVD.iso' % (self.config.get('pungi', 'iso_basename'), self.config.get('pungi', 'version'),
                 self.config.get('pungi', 'arch'))
         else:
-            isoname = '%s-%s-%s.iso' % (self.config.get('pungi', 'iso_basename'), self.config.get('pungi', 'version'), 
+            isoname = '%s-%s-%s.iso' % (self.config.get('pungi', 'iso_basename'), self.config.get('pungi', 'version'),
                 self.config.get('pungi', 'arch'))
 
         isofile = os.path.join(self.isodir, isoname)
 
         if not self.config.get('pungi', 'arch') == 'source':
             # move the main repodata out of the way to use the split repodata
-            if os.path.isdir(os.path.join(self.config.get('pungi', 'destdir'), 
+            if os.path.isdir(os.path.join(self.config.get('pungi', 'destdir'),
                                           'repodata-%s' % self.config.get('pungi', 'arch'))):
-                shutil.rmtree(os.path.join(self.config.get('pungi', 'destdir'), 
+                shutil.rmtree(os.path.join(self.config.get('pungi', 'destdir'),
                                            'repodata-%s' % self.config.get('pungi', 'arch')))
-                
-            shutil.move(os.path.join(self.topdir, 'repodata'), os.path.join(self.config.get('pungi', 'destdir'), 
+
+            shutil.move(os.path.join(self.topdir, 'repodata'), os.path.join(self.config.get('pungi', 'destdir'),
                 'repodata-%s' % self.config.get('pungi', 'arch')))
             shutil.copytree('%s-disc1/repodata' % self.topdir, os.path.join(self.topdir, 'repodata'))
 
@@ -1126,7 +1141,7 @@ cost=500
                 self.config.get('pungi', 'version'), self.config.get('pungi', 'arch')))
 
         extraargs.extend(['-o', isofile])
-        
+
         if not self.config.get('pungi', 'arch') == 'source':
             extraargs.append(self.topdir)
         else:
@@ -1154,9 +1169,9 @@ cost=500
         # return the .discinfo file
         if not self.config.get('pungi', 'arch') == 'source':
             shutil.rmtree(os.path.join(self.topdir, 'repodata')) # remove our copied repodata
-            shutil.move(os.path.join(self.config.get('pungi', 'destdir'), 
+            shutil.move(os.path.join(self.config.get('pungi', 'destdir'),
                 'repodata-%s' % self.config.get('pungi', 'arch')), os.path.join(self.topdir, 'repodata'))
-            
+
         # Move the unified disk out
         if not self.config.get('pungi', 'arch') == 'source':
             shutil.rmtree(os.path.join(self.workdir, 'os-unified'), ignore_errors=True)
@@ -1188,7 +1203,7 @@ cost=500
                 self.config.set('pungi', 'discs', str(discs))
                 self.doCreateMediarepo(split=True)
             for disc in range(1, discs + 1): # cycle through the CD isos
-                isoname = '%s-%s-%s-disc%s.iso' % (self.config.get('pungi', 'iso_basename'), self.config.get('pungi', 'version'), 
+                isoname = '%s-%s-%s-disc%s.iso' % (self.config.get('pungi', 'iso_basename'), self.config.get('pungi', 'version'),
                     self.config.get('pungi', 'arch'), disc)
                 isofile = os.path.join(self.isodir, isoname)
 
